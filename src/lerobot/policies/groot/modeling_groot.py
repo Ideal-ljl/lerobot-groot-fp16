@@ -119,6 +119,11 @@ class GrootPolicy(PreTrainedPolicy):
             _tie_unused_qwen_lm_head(qwen_model)
         if self.config.dtype == torch.float32:
             self._cast_model_parameters_to_fp32(model)
+        elif self.config.dtype == torch.float16:
+            # Parameters and floating buffers, as for an FP16 deployment of the whole model.
+            model.to(dtype=torch.float16)
+        if self.config.pure_fp16:
+            model.backbone.enable_pure_fp16()
         return model
 
     @staticmethod

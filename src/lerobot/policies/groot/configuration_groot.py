@@ -348,7 +348,11 @@ class GrootConfig(PreTrainedConfig):
     warmup_ratio: float = 0.05
     use_bf16: bool = True
     # The native N1.7 fine-tuning recipe keeps model parameters in FP32 and computes under BF16 autocast.
+    # torch.float16 stores the parameters in FP16 for FP16 inference (requires use_bf16=False).
     dtype: torch.dtype | None = torch.float32
+    # FP16 inference only (dtype=torch.float16): also run the Qwen3-VL RMSNorm and RoPE in FP16 instead
+    # of transformers' FP32 upcast, with an overflow-safe scaled RMSNorm. See fp16_precision.py.
+    pure_fp16: bool = False
 
     # Deprecated and ignored: superseded by `dtype`. Declared only so configs written before the
     # rename still parse — draccus rejects config.json keys the dataclass no longer declares.
@@ -449,8 +453,14 @@ class GrootConfig(PreTrainedConfig):
             raise ValueError(message)
 
         super().__post_init__()
-        if self.dtype not in {torch.float32, torch.bfloat16}:
-            raise ValueError(f"Unsupported dtype={self.dtype!r}. Expected torch.float32 or torch.bfloat16.")
+        if self.dtype not in {torch.float32, torch.bfloat16, torch.float16}:
+            raise ValueError(
+                f"Unsupported dtype={self.dtype!r}. Expected torch.float32, torch.bfloat16 or torch.float16."
+            )
+        if self.dtype == torch.float16 and self.use_bf16:
+            raise ValueError("dtype=torch.float16 runs without BF16 autocast; set use_bf16=False.")
+        if self.pure_fp16 and self.dtype != torch.float16:
+            raise ValueError(f"pure_fp16=True requires dtype=torch.float16, got dtype={self.dtype!r}.")
 
         if self.n_action_steps > self.chunk_size:
             raise ValueError(

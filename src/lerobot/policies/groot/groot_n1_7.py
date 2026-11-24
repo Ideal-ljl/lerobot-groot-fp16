@@ -39,6 +39,7 @@ from ..common.flow_matching import (
 )
 from .action_head.cross_attention_dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from .configuration_groot import N1_7_DEFAULT_IMAGE_CROP_SIZE, N1_7_DEFAULT_IMAGE_TARGET_SIZE
+from .fp16_precision import enable_pure_fp16, pure_fp16_vision_rope
 
 if TYPE_CHECKING or _transformers_available:
     from transformers import (
@@ -313,11 +314,17 @@ class Qwen3Backbone(nn.Module):
             self.language_model.layers.pop(-1)
 
         self.select_layer = select_layer
+        self.pure_fp16 = False
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
         if load_bf16 and trainable_params_fp32:
             for parameter in self.parameters():
                 if parameter.requires_grad:
                     parameter.data = parameter.data.to(torch.float32)
+
+    def enable_pure_fp16(self) -> None:
+        """Run the Qwen3-VL RMSNorm and RoPE in the model dtype (see ``fp16_precision``)."""
+        enable_pure_fp16(self.model)
+        self.pure_fp16 = True
 
     def set_trainable_parameters(
         self, tune_llm: bool, tune_visual: bool, tune_top_llm_layers: int = 0
@@ -445,7 +452,11 @@ class Qwen3Backbone(nn.Module):
 
         hook = self.language_model.layers[-1].register_forward_hook(capture_output)
         try:
-            outputs = self.model(**model_input, output_hidden_states=True)
+            if self.pure_fp16:
+                with pure_fp16_vision_rope():
+                    outputs = self.model(**model_input, output_hidden_states=True)
+            else:
+                outputs = self.model(**model_input, output_hidden_states=True)
         finally:
             hook.remove()
 
