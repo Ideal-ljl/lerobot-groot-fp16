@@ -1,0 +1,81 @@
+Force FP16：NX 上的 GR00T N1.7 100 条基准，v1
+
+用途
+  在其他项目中复用完全相同的输入和初始噪声，比较模型结果与本机 Force FP16 输出。
+  数据是 100 条固定的合成 DROID 观测，不是真实机器人采集数据，也不是任务成功率测试。
+  case_000 至 case_099 与此前本地实验的 100 条输入一致。请直接读取保存的数组，勿重新生成。
+
+文件
+  raw_inputs.npz：case_ids、input_sha256、tasks、state、两路 RGB 图像、noise。
+  model_inputs/case_NNN.npz：该条数据预处理后的模型输入，以及 noise；保留 batch=1。
+  reference_outputs.npz：case_ids、input_sha256、raw、decoded、action_ranges。
+    raw     = [100,40,132]，float16，模型输出的归一化动作，前 17 维是此 embodiment 的有效维度。
+    decoded = [100,40,17]，float16，与该条状态对应的最终解码动作。
+    action_ranges = [17]，float64，统计数据中的 q99-q01，用于计算归一化误差。
+  manifest.json：环境、权重版本/哈希、运行配置、维度定义、每条输入的形状/类型/哈希、验证结果。
+  effective_policy_config/：本次实际加载后的 policy 配置。
+  checkpoint_metadata/：原 checkpoint 配置、统计、embodiment 和实验配置；原配置中的 BF16
+    字段不代表本次执行精度，本次以 manifest.json 和 effective_policy_config 为准。
+  processor_assets/：本次实际使用的 Cosmos tokenizer 和 processor 配置。
+  provenance/：Force FP16 实现、模型/处理器源码和本机导出脚本快照。
+  environment_freeze.txt：本机依赖版本记录，不是跨硬件通用安装清单。
+  dtype_audits.json：100 次模型前向的 FP16 张量审计。
+  SHA256SUMS：包内文件完整性校验。
+
+输入约定
+  原始数组的第 0 维是 case，第 1 维是 batch=1。图像为 float32 RGB NCHW，范围 [0,1]。
+  初始噪声逐条为 [1,40,132] float16；务必复用保存值，而不是只设置相同随机种子。
+  模型张量的形状/类型以 manifest.json 的 cases[].model_arrays 为准；文本长度可变化。
+  保留整数、布尔张量类型。保存的浮点输入是进入模型前的类型，Force FP16 在模型内强制精度。
+  批大小为 1，逐条运行，不要将 100 条合成一个 batch 后要求逐位一致。
+
+Force FP16 定义与复现
+  FP16 权重，缩放 RMSNorm，FP16 文本/视觉 RoPE，模型所有显式浮点张量运算均强制 FP16。
+  仓库的 pure_fp16=True 只覆盖部分模块；必须额外应用
+  provenance/examples/groot_fp16/full_fp16_experiment.py 中的 full_fp16()，或在目标项目实现等效运算。
+  inference_mode + eval；use_bf16=False；use_flash_attention=False；4 个去噪步；TF32 关闭。
+  不强制预处理/后处理精度，不改变 CUDA 内核内部累加精度。
+  RMSNorm 实现见 provenance/src/lerobot/policies/groot/fp16_precision.py。
+  推理调用边界为 policy.predict_action_chunk(model_input, noise=noise)，外包 full_fp16()。
+  权重未随包重复分发；使用 manifest.json 中的 checkpoint_repo、checkpoint_revision 和哈希。
+
+两种验证方式
+  1. 模型计算：读取 model_inputs 和 noise，输出 raw，与 reference_outputs 中 raw 对比。
+  2. 全流程：从 raw_inputs 开始预处理、推理、解码，输出 decoded，与 decoded 基准对比。
+     相对动作解码依赖当前观测的原始状态！使用仓库处理器时，每条必须按 pre(batch) ->
+     推理 -> post(raw) 顺序运行；不要先预处理全部数据再解码，这会使用错误的状态缓存。
+  如果直接使用保存的模型输入但仍调用仓库后处理，先对同条 raw_batch 调用 pre，刷新状态缓存。
+
+跨项目读取示例（只读数据和比较工具需要 Python >=3.10、NumPy；无需安装 LeRobot）
+  from baseline_tools import iter_cases
+  for case in iter_cases('/path/to/force_fp16_baseline_100_v1'):
+      case_id = case['case_id']
+      raw_batch = case['raw_batch']       # NumPy 图像/状态及 task 列表
+      model_input = case['model_input']   # NumPy 字典，含 batch 维
+      noise = case['noise']               # [1,40,132]
+      # 在这里调用你项目的推理代码；PyTorch 可逐项 torch.from_numpy(...).to(device)。
+      # 输出 [1,40,132] 或 [1,40,17]，移除 batch 维后按 case 顺序堆叠。
+
+候选结果格式与对比
+  保存 candidate.npz：必须包含原顺序的 case_ids 和 input_sha256，另含 raw 和/或 decoded。
+  这两个标识只标记输入身份，目标项目仍需确保实际使用对应输入。
+  可复制 raw_inputs.npz 中的标识；模型结果必须由目标项目运行生成。
+  numpy.savez('candidate.npz', case_ids=ids, input_sha256=hashes, raw=raw_outputs,
+              decoded=decoded_outputs)
+
+  python baseline_tools.py verify
+  python baseline_tools.py compare /path/to/candidate.npz --output comparison.json
+  python baseline_tools.py compare /path/to/candidate.npz --atol 0.001 --rtol 0 --output comparison.json
+
+  默认容差为 0；命令退出码 0 表示数值在容差内，1 表示不通过。
+  bitexact_cases 额外要求 dtype 和字节一致；numeric_exact_cases 仅要求数值一致。
+  工具拒绝错序、缺少 case、错误形状和非有限输出。
+  decoded 的 M = max(|candidate-reference|/(q99-q01))*100，遍历时间和动作维度。
+  raw 的全部 132 维都比较，包含未用于最终动作的维度；不要混用 raw 与 decoded。
+
+复现范围
+  本包代表本机 NX 的当前实现。100 条新运行的输出与此前同输入的 Force FP16 结果一致。
+  不同 GPU、内核或框架版本可能产生数值差异；工具会报告具体偏差，不默认放宽阈值。
+  导出与打包命令见仓库 README 的 Force FP16 章节；使用 examples/groot_fp16 下的正式脚本。
+  原始 v1 Release 保留了本机 .dev 脚本快照，其中也包含 Python 3.10 的本机兼容处理。
+  导出脚本拒绝覆盖现有同名目录；重新导出前请修改输出目录。

@@ -1,6 +1,85 @@
 # GR00T N1.7 纯 FP16 推理与精度复测
 
-这是 [huggingface/lerobot](https://github.com/huggingface/lerobot) 在 `8476881` 处的快照，加了一项改动：GR00T N1.7 可以完全在 FP16 下推理，backbone 里没有任何 FP32 计算。这样可以测只支持 FP16 的芯片（例如 Jetson Orin NX）上的整体精度。本节之后是上游原版 README。
+这是 [huggingface/lerobot](https://github.com/huggingface/lerobot) 在 `8476881` 处的快照，加入了 GR00T N1.7 的 FP16 数值实验。`pure_fp16` 将 RMSNorm/RoPE 改为 FP16；**Force FP16** 在此基础上强制模型其余显式浮点张量运算也使用 FP16。预处理、后处理及 CUDA 内核内部累加精度保持原实现。本节之后是上游原版 README。
+
+## Force FP16：当前实验方案与 NX 基准
+
+`pure_fp16=True` 已经使用缩放 RMSNorm，但视觉位置插值、时间编码等仍有 FP32 运算。Force FP16 在该配置上额外套用 `examples/groot_fp16/full_fp16_experiment.py` 的 `full_fp16()` 上下文，并逐算子检查浮点输出。它用于单线程数值实验；Python 调度有额外开销，计时不能当作部署性能。
+
+```python
+from examples.groot_fp16.full_fp16_experiment import full_fp16
+
+# policy 需使用 dtype=torch.float16, use_bf16=False, pure_fp16=True 加载。
+# pre 和 post 必须是同一套关联的处理器；相对动作解码依赖 pre 缓存的当前状态。
+model_input = pre(raw_batch)
+with torch.inference_mode():
+    with full_fp16():
+        raw_actions = policy.predict_action_chunk(model_input, noise=fixed_noise)
+    actions = post(raw_actions)
+```
+
+### 100 条可下载的固定基准
+
+[Release：force-fp16-baseline-v1](https://github.com/Ideal-ljl/lerobot-groot-fp16/releases/tag/force-fp16-baseline-v1) 包含约 235 MB 的压缩包与 SHA256 校验文件。大数据存放在 Release 附件中，代码保存在本仓库。
+
+包内包含两路图像、状态、指令、固定初始噪声、逐条模型输入、原始输出 `[100,40,132]`、最终动作 `[100,40,17]`、配置/环境和源码快照。数据是合成 DROID 观测，不是真实机器人任务评测。权重不包含在包中；准确 revision 和哈希见 `manifest.json`。
+
+下载两个附件并解压后，在仓库根目录运行（比较工具只需要 NumPy）：
+
+```bash
+sha256sum -c force_fp16_baseline_100_v1.tar.gz.sha256
+tar -xzf force_fp16_baseline_100_v1.tar.gz
+uv run --no-project --with numpy python examples/groot_fp16/baseline_tools.py \
+  --bundle ./force_fp16_baseline_100_v1 verify
+uv run --no-project --with numpy python examples/groot_fp16/baseline_tools.py \
+  --bundle ./force_fp16_baseline_100_v1 compare candidate.npz --output comparison.json
+```
+
+`candidate.npz` 必须含原顺序的 `case_ids`、`input_sha256`，以及目标项目计算的 `raw` 和/或 `decoded`。默认容差为 0；也可显式传入 `--atol`、`--rtol`。形状、dtype、解码与输入读取细节见包内 `README.txt`。
+
+### 在本仓库回放或复查 20 条 × 3 轮
+
+模型运行要求 Python 3.12+、适配设备的 CUDA PyTorch 及 GR00T 依赖。使用本机已有环境时，可在下列命令的 `uv run` 后添加 `--no-project --python /path/to/python`，避免重建环境。
+
+```bash
+uv run python examples/groot_fp16/replay_baseline.py \
+  --bundle ./force_fp16_baseline_100_v1 \
+  --ckpt ./checkpoints/GR00T-N1.7-3B \
+  --cases 20 --repeats 3 --out outputs/force_fp16_replay_20x3
+```
+
+默认直接使用保存的模型输入；`--input-mode raw` 则重新预处理原始观测，并要求张量与保存值完全一致。两种路径都会先用当前观测刷新解码状态。每轮结果保存为 `round_N.npz`，重复性与基准偏差保存为 `summary.json`。回放全部基准使用 `--cases 100`；100 条的结果可以直接交给上面的比较工具。
+
+NX 本次 20 条 × 3 轮的原始输出和最终动作全部逐位一致，轮间最大差值为 0。另一次 100 条导出的最终动作均与此前 Force FP16 输出一致。跨设备应使用保存的数组和噪声，不能只依赖相同种子重新生成输入。
+
+### 消融实验与重新导出
+
+以下脚本复现本地实验过程，从仓库根目录运行。`--ckpt` 和 `--processor` 均为本地目录；processor 使用配套 Cosmos-Reason2-2B 的 tokenizer/config 文件，无需下载其模型权重。
+
+```bash
+uv run python examples/groot_fp16/run_groot_rms_ablation.py \
+  --ckpt ./checkpoints/GR00T-N1.7-3B --processor ./checkpoints/Cosmos-Reason2-2B \
+  --cases 100 --repeats 2 --out outputs/groot_rms_ablation
+uv run python examples/groot_fp16/run_force_fp16_repeatability.py \
+  --ckpt ./checkpoints/GR00T-N1.7-3B --processor ./checkpoints/Cosmos-Reason2-2B \
+  --source outputs/groot_rms_ablation --out outputs/force_fp16_20x3
+uv run python examples/groot_fp16/export_force_fp16_baseline.py \
+  --ckpt ./checkpoints/GR00T-N1.7-3B --processor ./checkpoints/Cosmos-Reason2-2B \
+  --source outputs/groot_rms_ablation --out outputs/force_fp16_baseline_new
+uv run python examples/groot_fp16/package_baseline.py outputs/force_fp16_baseline_new
+```
+
+导出脚本从输入目录读取精确的 100 条输入及 Force FP16 结果，重新推理并校验一致性。checkpoint 目录需包含原下载时的 `download_manifest.json`（含 `revision`）；脚本重新计算权重 SHA256。现有 v1 Release 保留原始本机脚本快照，包括 Python 3.10 的本机兼容处理；上面的正式脚本按仓库支持的 Python 版本运行。
+
+NX 的 100 条消融结果，以本机默认 FP16（保留原有 FP32 运算）为基准，M 为每条最大归一化动作误差：
+
+| 模式 | M > 10% | M 中位数 | M 最大值 |
+|---|---:|---:|---:|
+| 全 FP16，朴素 RMSNorm | 98/100 | 90.78% | 103.06% |
+| **Force FP16（缩放 RMSNorm）** | **0/100** | **0.70%** | **5.54%** |
+| `pure_fp16` | 0/100 | 0.19% | 3.44% |
+
+历史结果字段 `full_fp16_scaled` 表示 Force FP16，`backbone_scaled` 表示 `pure_fp16`。下方 A100 实验使用不同参考，数字不能直接与本表比较。
 
 ## 为什么需要这个改动
 
@@ -75,7 +154,7 @@ python examples/groot_fp16/verify_fp16.py \
 
 脚本做了这些事：
 
-- **用例**：生成 100 个合成的 DROID 用例，在 CPU 上用固定种子生成，所以每台机器上的输入完全相同。每个用例包含：
+- **用例**：生成 100 个合成的 DROID 用例，在 CPU 上用固定种子生成；不同 PyTorch/平台不保证逐位一致，必须检查输入哈希。每个用例包含：
   - state：在 q01–q99 之间均匀采样
   - 两路 256×256 平滑随机图像
   - 一条任务文本

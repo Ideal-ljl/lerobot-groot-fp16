@@ -18,8 +18,10 @@
 
 Transformers' Qwen3-VL keeps two FP32 islands even when the model runs in FP16: the text RMSNorm
 upcasts its input to FP32 before computing the variance, and both the text and the vision RoPE build
-cos/sin (and, for vision, apply the rotation) in FP32. ``enable_pure_fp16`` removes them so that every
-tensor op of the backbone runs in the model dtype, which is what an FP16-only accelerator executes.
+cos/sin (and, for vision, apply the rotation) in FP32. ``enable_pure_fp16`` changes those operations
+to the model dtype. Other FP32 operations can remain, including vision positional interpolation
+and action time embeddings. The Force FP16 experimental context in ``examples/groot_fp16`` also
+enforces the dtype of those remaining explicit floating tensor operations.
 
 Simply dropping the RMSNorm upcast is not usable: the GR00T N1.7 backbone carries a massive activation
 (|x| ~ 15300 on the first token, channel 1793, from layer 12 on, independent of the input), and x^2
