@@ -1,3 +1,126 @@
+# GR00T N1.7 纯 FP16 推理与精度复测
+
+这是 [huggingface/lerobot](https://github.com/huggingface/lerobot) 在 `8476881` 处的快照，加了一项改动：GR00T N1.7 可以完全在 FP16 下推理，backbone 里没有任何 FP32 计算。这样可以测只支持 FP16 的芯片（例如 Jetson Orin NX）上的整体精度。本节之后是上游原版 README。
+
+## 为什么需要这个改动
+
+transformers 的 Qwen3-VL 即使在 FP16 下运行，也会把两类计算放回 FP32：
+
+- RMSNorm 的方差计算
+- 文本和视觉 RoPE 的 cos/sin（视觉部分还包括旋转本身）
+
+只把 RMSNorm 改成 FP16 不行。GR00T N1.7 的 backbone 从第 12 层起有一个和输入无关的超大激活：第 0 个 token 的第 1793 通道，|x| ≈ 15300。它的 x² 超过 FP16 上限 65504，方差变成 inf，`rsqrt(inf)=0`，这个 token 被整行清零，而且不会报 NaN。结果是 100 个用例里 98 个的动作误差超过 10%。
+
+这里的解决办法是对 RMSNorm 做缩放：先算 s = max|x|，再归一化 y = x/s，即 `w·y·rsqrt(mean(y²) + (√eps/s)²)`。数学上它和原式相等，全程都是 FP16，也不会溢出。
+
+## 改动内容
+
+| 文件 | 内容 |
+|---|---|
+| `src/lerobot/policies/groot/fp16_precision.py` | 包含 `fp16_safe_rms_norm`、`enable_pure_fp16(module)` 和 `pure_fp16_vision_rope()`。`enable_pure_fp16` 只替换传入模块里的实例，`pure_fp16_vision_rope()` 是上下文管理器，退出时会恢复 transformers 的全局函数 |
+| `configuration_groot.py` | 新增 `pure_fp16: bool = False`，`dtype` 允许设为 `torch.float16`。FP16 必须配合 `use_bf16=False` 使用，`pure_fp16=True` 必须配合 `dtype=float16` |
+| `modeling_groot.py` / `groot_n1_7.py` | 按配置把模型转成 FP16，并启用纯 FP16 |
+| `tests/policies/groot/test_groot_fp16_precision.py` | 5 个单元测试，见下文测试 1 |
+| `examples/groot_fp16/verify_fp16.py` | 整模型精度复测脚本，见下文测试 2 |
+| `examples/groot_fp16/reference_a100.npz` | A100 上 fp32、fp16、fp16_pure 三种模式的动作输出，以及每个用例输入的 sha256 |
+
+使用方法：
+
+```python
+policy = GrootPolicy.from_pretrained(
+    "nvidia/GR00T-N1.7-3B", embodiment_tag="oxe_droid_relative_eef_relative_joint",
+    dtype=torch.float16, use_bf16=False, pure_fp16=True,
+)
+```
+
+## 在新设备上需要做的测试
+
+### 0. 环境准备
+
+lerobot 要求 Python 3.12 及以上。Jetson 上需要先装好与 JetPack 对应、带 CUDA 的 PyTorch，再安装本仓库：
+
+```bash
+git clone https://github.com/Ideal-ljl/lerobot-groot-fp16.git && cd lerobot-groot-fp16
+pip install -e ".[groot]"
+pip install pytest
+hf download nvidia/GR00T-N1.7-3B --local-dir ./checkpoints/GR00T-N1.7-3B   # 约 6.5 GB
+```
+
+安装完先用这条命令确认 CUDA 可用：
+
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+### 1. 单元测试（不需要权重，几秒完成）
+
+```bash
+pytest tests/policies/groot/test_groot_fp16_precision.py -v
+```
+
+5 个测试应该全部通过，分别验证：
+
+- 带超大激活时，缩放 RMSNorm 与 FP32 结果一致
+- 朴素 FP16 RMSNorm 确实会把该 token 清零，说明这个改动是必要的
+- `enable_pure_fp16` 只替换传入的模块，并且可以重复调用
+- 纯 FP16 模式下视觉 RoPE 以 FP16 计算，退出后全局函数已恢复
+- 配置校验规则生效
+
+### 2. 整模型 FP16 精度复测（需要权重和 GPU）
+
+```bash
+python examples/groot_fp16/verify_fp16.py \
+  --ckpt ./checkpoints/GR00T-N1.7-3B --out ./fp16_results
+```
+
+脚本做了这些事：
+
+- **用例**：生成 100 个合成的 DROID 用例，在 CPU 上用固定种子生成，所以每台机器上的输入完全相同。每个用例包含：
+  - state：在 q01–q99 之间均匀采样
+  - 两路 256×256 平滑随机图像
+  - 一条任务文本
+  - 固定的 FP16 初始噪声
+- **模式**：默认跑 `fp16`（transformers 默认行为，RMSNorm/RoPE 仍用 FP32）和 `fp16_pure`（本改动）两种，各跑 2 遍。
+- **对比基准**：结果与 `reference_a100.npz` 里 A100 的 FP32 输出比较。
+
+内存够的话可以加上 `--modes fp32 fp16 fp16_pure`，在本机也跑一遍 FP32 作为基准。FP32 权重约 13 GB，16 GB 的 Orin NX 大概率放不下，所以默认使用 A100 的结果作为基准。
+
+想先快速确认流程能跑通，可以加 `--cases 5 --repeats 1`。
+
+**误差指标**：每个动作维度的误差为 |a − ref| / (q99 − q01)，单位是 %。对一个用例，E 是这些误差的均值，M 是最大值。
+
+**判定**：输出最后打印 `fp16_pure: PASS` 即为通过，需要同时满足以下条件（对应 `summary.json` 里的 `fp16_pure_checks`）：
+
+| 检查项 | 含义 |
+|---|---|
+| `inputs_identical` | 输入的 sha256 与 A100 运行时逐个用例一致，否则误差没有可比性 |
+| `pure_fp16_enabled` | backbone 的 RMSNorm 类已换成 `PureFP16Qwen3VLTextRMSNorm` |
+| `vision_rope_global_restored` | 退出后 transformers 的全局函数已恢复 |
+| `no_violation` | 没有非有限值，也没有用例的 M 超过 10% |
+
+**其他输出**（写入 `fp16_results/summary.json`，动作写入 `actions.npz`）：
+
+| 字段 | 含义 |
+|---|---|
+| `repeat_bitexact_cases` | 两次运行逐位相同的用例数。A100 上是 100/100，不一致说明设备上的 kernel 结果不确定 |
+| `vs_a100_same_mode_max_abs_diff` | 与 A100 同一模式的最大绝对差，反映不同硬件间的差异 |
+| `latency_s_median` | 单个用例 `predict_action_chunk` 的耗时中位数，不含首次预热，只作参考 |
+| `peak_mem_gib` | 峰值显存 |
+
+### A100 参考结果（100 个用例，与 A100 FP32 对比）
+
+| 模式 | M > 10% 的用例 | M 最大值 | M 中位数 | M p95 | E 均值 | 重复运行逐位一致 |
+|---|---|---|---|---|---|---|
+| fp16（RMSNorm/RoPE 用 FP32） | 0/100 | 2.85% | 0.19% | 1.68% | 0.032% | 100/100 |
+| **fp16_pure（本改动）** | **0/100** | **4.78%** | **0.22%** | **1.73%** | **0.036%** | **100/100** |
+| fp16_pure 但不缩放 RMSNorm（朴素） | 98/100 | — | — | — | — | — |
+
+另外在 x86 CPU 上跑了前 2 个用例做交叉检查：CPU FP32 与 A100 FP32 的 M 最大值为 0.23%，CPU fp16_pure 与 A100 FP32 的 M 最大值为 1.04%，结果为 PASS。
+
+如果新设备上 `fp16_pure` 的 M 明显高于上表，而 `fp16` 正常，通常是芯片的 FP16 归约、rsqrt 或 RoPE 实现有问题。如果两种模式都偏高，问题更可能出在 GEMM/SDPA 的累加精度上。
+
+---
+
 <p align="center">
   <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
 </p>
