@@ -43,26 +43,13 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from lerobot.policies.common.fp16 import fp16_safe_rms_norm
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 if TYPE_CHECKING or _transformers_available:
     import transformers.models.qwen3_vl.modeling_qwen3_vl as _qwen3_vl
 else:
     _qwen3_vl = None
-
-
-def fp16_safe_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMSNorm computed in the input dtype without overflowing FP16.
-
-    ``out = w * y * rsqrt(mean(y^2) + eps / s^2)`` with ``s = max|x|`` per row and ``y = x / s``.
-    ``eps / s^2`` is formed as ``(sqrt(eps) / s)^2`` so that ``s^2`` is never materialised.
-    """
-    scale = hidden_states.abs().amax(dim=-1, keepdim=True)
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))  # all-zero rows: plain eps path
-    normed = hidden_states / scale
-    variance = normed.pow(2).mean(-1, keepdim=True)
-    scaled_eps = (torch.full_like(scale, eps**0.5) / scale).pow(2)
-    return weight * (normed * torch.rsqrt(variance + scaled_eps))
 
 
 def _fp16_safe_rms_norm_forward(self: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:

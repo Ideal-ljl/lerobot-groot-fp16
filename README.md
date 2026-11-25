@@ -1,4 +1,29 @@
-# GR00T N1.7 纯 FP16 推理与精度复测
+# SmolVLA 与 GR00T 的 Force FP16 推理实验
+
+## SmolVLA 离线精度复测
+
+在仓库根目录下载 SmolVLA 策略、归一化参数和 SmolVLM2 处理器。脚本从完整的策略 checkpoint 加载视觉语言模型和动作专家，因此 backbone 目录只需提供配置和分词文件。
+
+```bash
+hf download lerobot/smolvla_base \
+  --revision 5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6 \
+  --local-dir checkpoints/smolvla_base
+hf download HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
+  --revision 4cde9d208e19519c36917aa170fffc7e381aa0ad \
+  config.json preprocessor_config.json processor_config.json tokenizer.json tokenizer_config.json \
+  special_tokens_map.json added_tokens.json chat_template.json vocab.json merges.txt \
+  --local-dir checkpoints/SmolVLM2-500M-Video-Instruct
+```
+
+在 Python 3.12+ 和 CUDA PyTorch 环境中运行：
+
+```bash
+HF_HUB_OFFLINE=1 uv run --locked --extra smolvla python -m examples.smolvla_fp16.verify_fp16
+```
+
+脚本用同一组合成相机图像、状态、文本指令和初始噪声运行 FP32 和 Force FP16，对比反归一化后的动作。Force FP16 复用 GR00T 实验的逐算子浮点输出检查，对 SmolVLA 的 Llama RMSNorm 应用缩放；处理器和 CUDA 内核内部累加精度在检查范围之外。输出包含动作形状、算子调用次数、平均和最大绝对误差。该实验用于单线程数值复测。
+
+## GR00T N1.7 纯 FP16 推理与精度复测
 
 这是 [huggingface/lerobot](https://github.com/huggingface/lerobot) 在 `8476881` 处的快照，加入了 GR00T N1.7 的 FP16 数值实验。`pure_fp16` 将 RMSNorm/RoPE 改为 FP16；**Force FP16** 在此基础上强制模型其余显式浮点张量运算也使用 FP16。预处理、后处理及 CUDA 内核内部累加精度保持原实现。本节之后是上游原版 README。
 
