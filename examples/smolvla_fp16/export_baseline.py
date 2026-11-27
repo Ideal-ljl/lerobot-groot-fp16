@@ -12,8 +12,7 @@ import numpy as np
 import torch
 import transformers
 
-from examples.groot_fp16.full_fp16_experiment import full_fp16
-from examples.smolvla_fp16.verify_fp16 import enable_force_fp16, load_policy
+from examples.smolvla_fp16.verify_fp16 import enable_force_fp16, infer_actions, load_policy, prepare_inputs
 from lerobot.policies.smolvla import SmolVLAPolicy
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import OBS_STATE
@@ -43,13 +42,8 @@ def digest(path: Path) -> str:
 def infer(
     policy: SmolVLAPolicy, post: PolicyProcessorPipeline, batch: dict[str, torch.Tensor], noise: torch.Tensor
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    policy.reset()
-    with full_fp16() as audit:
-        raw = policy.predict_action_chunk(batch, noise=noise)
-    decoded = post(raw.float()).float()
-    if raw.dtype != torch.float16 or not (raw.isfinite().all() and decoded.isfinite().all()):
-        raise ValueError("Expected finite Force FP16 actions")
-    return raw.cpu().numpy(), decoded.cpu().numpy(), sum(audit.ops.values())
+    raw, actions, calls = infer_actions(policy, post, batch, noise)
+    return raw.cpu().numpy(), actions.cpu().numpy(), calls
 
 
 def check_bits(actual: np.ndarray, expected: np.ndarray, label: str) -> None:
@@ -66,7 +60,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", type=Path, default=Path("checkpoints/smolvla_base"))
     parser.add_argument("--backbone", type=Path, default=Path("checkpoints/SmolVLM2-500M-Video-Instruct"))
-    parser.add_argument("--out", type=Path, default=Path("outputs/smolvla_force_fp16_baseline_10.zip"))
+    parser.add_argument("--out", type=Path, default=Path("outputs/smolvla_force_fp16_2step_baseline_10.zip"))
     args = parser.parse_args()
     if args.out.exists():
         parser.error(f"Output already exists: {args.out}")
@@ -86,22 +80,26 @@ def main() -> None:
         for i, task in enumerate(TASKS):
             seed = 42 + i
             rng = torch.Generator().manual_seed(seed)
-            obs = {key: torch.rand(f.shape, generator=rng) for key, f in cfg.image_features.items()}
-            obs[OBS_STATE] = torch.randn(state.shape, generator=rng)
-            batch = pre({**obs, "task": task})
-            noise = torch.randn((1, cfg.chunk_size, cfg.max_action_dim), generator=rng).cuda()
-            inputs = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            obs = {
+                key: torch.rand(f.shape, generator=rng, dtype=torch.float16)
+                for key, f in cfg.image_features.items()
+            }
+            obs[OBS_STATE] = torch.randn(state.shape, generator=rng, dtype=torch.float16)
+            inputs = prepare_inputs(pre, obs, task)
+            noise = torch.randn(
+                (1, cfg.chunk_size, cfg.max_action_dim), generator=rng, dtype=torch.float16
+            ).cuda()
             arrays = {"obs/" + k: v.numpy().copy() for k, v in obs.items()}
             arrays.update({"input/" + k: v.cpu().numpy().copy() for k, v in inputs.items()})
-            raw, decoded, calls = infer(policy, post, dict(inputs), noise)
+            raw, actions, calls = infer(policy, post, inputs, noise)
             path = root / f"case_{i:03}.npz"
             np.savez_compressed(
-                path, **arrays, task=task, noise=noise.cpu().numpy(), raw=raw, decoded=decoded
+                path, **arrays, task=task, noise=noise.cpu().numpy(), raw=raw, decoded=actions
             )
 
             with np.load(path, allow_pickle=False) as saved:
                 observation = {k[4:]: torch.from_numpy(saved[k]) for k in saved.files if k.startswith("obs/")}
-                restored = pre({**observation, "task": saved["task"].item()})
+                restored = prepare_inputs(pre, observation, saved["task"].item())
                 for k in inputs:
                     check_bits(restored[k].cpu().numpy(), saved["input/" + k], k)
                 for _ in range(2):
@@ -110,8 +108,12 @@ def main() -> None:
                     check_bits(r, saved["raw"], f"{path.name} raw")
                     check_bits(d, saved["decoded"], f"{path.name} decoded")
             cases.append({"file": path.name, "seed": seed, "sha256": digest(path), "operator_calls": calls})
-            print(f"{path.name}: inputs verified, raw and decoded bit-exact on both replays", flush=True)
+            print(
+                f"{path.name}: inputs verified, raw and final actions bit-exact on both replays", flush=True
+            )
         manifest = {
+            "format_version": 2,
+            "scoring_output": "decoded",
             "model": "lerobot/smolvla_base",
             "weight_sha256": digest(args.ckpt / "model.safetensors"),
             "checkpoint_metadata_sha256": {
@@ -122,7 +124,10 @@ def main() -> None:
             "backbone_assets_sha256": {
                 p.name: digest(p) for p in sorted(args.backbone.iterdir()) if p.suffix in {".json", ".txt"}
             },
-            "precision": "Force FP16, scaled Llama RMSNorm, TF32 off; processors outside full_fp16",
+            "precision": (
+                "FP16 observations, noise, normalization, forward and unnormalization; "
+                "scaled Llama RMSNorm, TF32 off, FP16 GEMM accumulation enabled"
+            ),
             "scaled_norms": norms,
             "denoising_steps": cfg.num_steps,
             "torch": str(torch.__version__),

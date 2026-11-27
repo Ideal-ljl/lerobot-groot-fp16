@@ -1,24 +1,34 @@
-# SmolVLA Force FP16 数值基准
+# SmolVLA Force FP16 两步基准（v2）
 
-在 Orin 上逐条运行合成观测，使用 batch=1、固定初始噪声，每条推理前重置策略。每个 case_NNN.npz 文件对应一条完整记录，NumPy 可直接读取。比较时使用文件中保存的张量和噪声，保留 batch 维及各自 dtype。
+每包有 10 条固定的合成算例。逐条推理（batch=1），每次重置策略，以封存的初始噪声执行 2 步 Flow Matching。基准设备见 manifest.json 的 gpu 字段。跨设备评分使用同一份基准包、相同权重及处理器，并比较 FP16 反归一化后的最终动作。
 
-| NPZ 键 | 含义 |
+| NPZ 键 | 内容 |
 |---|---|
-| obs/observation.images.camera1、camera2、camera3（均带相同前缀） | 三路合成 RGB 图像，各为 float32 CHW，范围 [0,1] |
-| obs/observation.state、task | 原始 6 维状态和文本指令 |
-| input/ 开头的全部数组 | 策略预处理器的张量输出，含 batch 维。去除 input/ 前缀后作为 predict_action_chunk 的 batch |
-| noise | 固定初始噪声，float32 [1,50,32]，经 noise 参数传入 |
-| raw | predict_action_chunk 的归一化动作，float16 [1,50,6] |
-| decoded | 使用配套后处理器处理 raw.float() 得到的动作，float32 [1,50,6] |
+| obs/observation.images.camera1、camera2、camera3（均带相同前缀） | 三路 FP16 合成 RGB 图像，CHW，范围 [0,1] |
+| obs/observation.state、task | 6 维 FP16 状态和文本指令 |
+| input/ 开头的数组 | 带 batch 维的策略输入。浮点张量为 FP16，词元编号和掩码保留各自类型 |
+| noise | 固定的 FP16 初始噪声，形状为 [1,50,32] |
+| raw | FP16 归一化动作，形状为 [1,50,6] |
+| decoded | **评分用最终动作**，由配套后处理器在 FP16 下反归一化得到，形状为 [1,50,6] |
 
-解压后可用以下代码读取一条。复现时使用同一 checkpoint、缩放 RMSNorm 和 full_fp16() 上下文。预处理与后处理在该上下文外运行。manifest.json 记录权重和各样本的 SHA256、运行环境及验证方法。
+manifest.json 记录步数、评分字段、权重及处理器文件的 SHA256、各算例的 SHA256 和运行环境。图像、状态和噪声直接按 FP16 生成，即使种子相同，也应使用 v2 包内实际封存的张量。旧版 10 步基准需要在 NX 上按新配置重新导出后才能用于两步实验评分。
+
+解压后可按下例在目标设备上回放一条算例。请从仓库根目录运行，并先按仓库 README 下载相同版本的策略和处理器。
 
 ```python
-import numpy as np
+from pathlib import Path
 
-with np.load("case_000.npz", allow_pickle=False) as case:
-    batch = {k.removeprefix("input/"): case[k] for k in case.files if k.startswith("input/")}
-    noise = case["noise"]
-    expected_raw = case["raw"]
-    expected_decoded = case["decoded"]
+import numpy as np
+import torch
+
+from examples.smolvla_fp16.verify_fp16 import enable_force_fp16, infer_actions, load_policy
+
+policy, _, post = load_policy(Path("checkpoints/smolvla_base"), Path("checkpoints/SmolVLM2-500M-Video-Instruct"))
+enable_force_fp16(policy)
+with torch.inference_mode(), np.load("case_000.npz", allow_pickle=False) as case:
+    batch = {k[6:]: torch.from_numpy(case[k]).cuda() for k in case.files if k.startswith("input/")}
+    noise = torch.from_numpy(case["noise"]).cuda()
+    _, actions, _ = infer_actions(policy, post, batch, noise)
+    actual = actions.cpu().numpy()
+    reference = case["decoded"]
 ```

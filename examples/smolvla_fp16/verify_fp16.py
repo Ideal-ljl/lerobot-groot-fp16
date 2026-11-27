@@ -1,4 +1,4 @@
-"""Compare SmolVLA FP32 and Force FP16 on one fixed synthetic observation, offline."""
+"""Verify two-step SmolVLA Force FP16 inference on one fixed synthetic observation."""
 
 import argparse
 from pathlib import Path
@@ -22,12 +22,13 @@ def load_policy(
     ckpt: Path, backbone: Path
 ) -> tuple[SmolVLAPolicy, PolicyProcessorPipeline, PolicyProcessorPipeline]:
     cfg = SmolVLAConfig.from_pretrained(ckpt)
+    cfg.num_steps = 2
     cfg.device = "cuda"
     cfg.vlm_model_name = str(backbone.resolve())
     cfg.load_vlm_weights = False
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    policy = SmolVLAPolicy.from_pretrained(ckpt, config=cfg, strict=True).float().eval()
+    policy = SmolVLAPolicy.from_pretrained(ckpt, config=cfg, strict=True).eval()
     pre, post = load_pretrained_policy_processors(
         ckpt,
         preprocessor_overrides={
@@ -39,6 +40,8 @@ def load_policy(
 
 
 def enable_force_fp16(policy: SmolVLAPolicy) -> int:
+    torch.backends.cuda.matmul.allow_fp16_accumulation = True
+    torch.backends.cuda.allow_fp16_bf16_reduction_math_sdp(True)
     policy.half()
     norms = [layer for layer in policy.modules() if isinstance(layer, LlamaRMSNorm)]
     if not norms:
@@ -46,6 +49,31 @@ def enable_force_fp16(policy: SmolVLAPolicy) -> int:
     for norm in norms:
         norm.forward = MethodType(scaled_rms_norm, norm)
     return len(norms)
+
+
+def prepare_inputs(
+    pre: PolicyProcessorPipeline, observation: dict[str, torch.Tensor], task: str
+) -> dict[str, torch.Tensor]:
+    with full_fp16():
+        prepared = pre({**observation, "task": task})
+    return {key: value for key, value in prepared.items() if isinstance(value, torch.Tensor)}
+
+
+def infer_actions(
+    policy: SmolVLAPolicy, post: PolicyProcessorPipeline, batch: dict[str, torch.Tensor], noise: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    if noise.dtype != torch.float16 or any(
+        value.is_floating_point() and value.dtype != torch.float16 for value in batch.values()
+    ):
+        raise ValueError("Expected FP16 noise and floating-point policy inputs")
+    policy.reset()
+    with full_fp16() as audit:
+        raw = policy.predict_action_chunk(dict(batch), noise=noise)
+        actions = post(raw)
+    for value in (raw, actions):
+        if value.dtype != torch.float16 or not value.isfinite().all():
+            raise ValueError("Expected finite FP16 actions")
+    return raw, actions, sum(audit.ops.values())
 
 
 @torch.inference_mode()
@@ -56,6 +84,7 @@ def main() -> None:
     parser.add_argument(
         "--repeats", type=int, default=1, help="Force FP16 runs with the same input and noise"
     )
+    parser.add_argument("--compare-fp32", action="store_true", help="Also run a separate FP32 reference")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
@@ -70,26 +99,29 @@ def main() -> None:
     if state_feature is None:
         raise ValueError("SmolVLA requires a state feature")
     observation = {
-        **{key: torch.rand(feature.shape, generator=rng) for key, feature in cfg.image_features.items()},
-        OBS_STATE: torch.randn(state_feature.shape, generator=rng),
-        "task": "Pick up the block.",
+        **{
+            key: torch.rand(feature.shape, generator=rng, dtype=torch.float16)
+            for key, feature in cfg.image_features.items()
+        },
+        OBS_STATE: torch.randn(state_feature.shape, generator=rng, dtype=torch.float16),
     }
-    batch = pre(observation)
-    noise = torch.randn((1, cfg.chunk_size, cfg.max_action_dim), generator=rng).to(cfg.device)
-    reference = post(policy.predict_action_chunk(dict(batch), noise=noise)).float()
-    norm_count = enable_force_fp16(policy)
+    task = "Pick up the block."
+    noise = torch.randn((1, cfg.chunk_size, cfg.max_action_dim), generator=rng, dtype=torch.float16).to(
+        cfg.device
+    )
+    if args.compare_fp32:
+        policy.float()
+        fp32_batch = pre({**{key: value.float() for key, value in observation.items()}, "task": task})
+        reference = post(policy.predict_action_chunk(fp32_batch, noise=noise.float())).float()
 
+    norm_count = enable_force_fp16(policy)
+    batch = prepare_inputs(pre, observation, task)
     first_run = {}
     for run in range(1, args.repeats + 1):
-        policy.reset()
-        with full_fp16() as audit:
-            actions = policy.predict_action_chunk(dict(batch), noise=noise)
-        candidate = post(actions.float()).float()
-        print(f"Run {run}: {tuple(actions.shape)}, {actions.dtype}, {sum(audit.ops.values())} operator calls")
-        for name, tensor in (("raw", actions), ("decoded", candidate)):
+        raw, actions, calls = infer_actions(policy, post, batch, noise)
+        print(f"Run {run}: {tuple(actions.shape)}, {actions.dtype}, {calls} operator calls")
+        for name, tensor in (("raw", raw), ("final actions", actions)):
             current = tensor.detach().cpu().contiguous()
-            if not current.isfinite().all():
-                raise RuntimeError(f"Non-finite {name} actions in run {run}")
             if run == 1:
                 first_run[name] = current.clone()
                 continue
@@ -97,11 +129,12 @@ def main() -> None:
             identical = torch.equal(current.view(torch.uint8), previous.view(torch.uint8))
             maximum = (current.float() - previous.float()).abs().max().item()
             print(f"  {name} vs run 1: bit_exact={identical}, max_abs_diff={maximum:.6g}")
-    delta = (candidate - reference).abs()
-    if not delta.isfinite().all():
-        raise RuntimeError("Non-finite actions in the FP32 or Force FP16 result")
     print(f"Actions {tuple(actions.shape)}, {actions.dtype}, {norm_count} scaled RMSNorm modules")
-    print(f"Decoded action absolute error: mean={delta.mean().item():.6g}, max={delta.max().item():.6g}")
+    if args.compare_fp32:
+        delta = (actions.float() - reference).abs()
+        if not delta.isfinite().all():
+            raise RuntimeError("Non-finite FP32 reference or comparison")
+        print(f"Action absolute error: mean={delta.mean().item():.6g}, max={delta.max().item():.6g}")
 
 
 if __name__ == "__main__":
