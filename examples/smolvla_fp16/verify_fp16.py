@@ -10,8 +10,15 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from examples.groot_fp16.full_fp16_experiment import full_fp16
 from lerobot.policies.common.fp16 import fp16_safe_rms_norm
 from lerobot.policies.smolvla import SmolVLAConfig, SmolVLAPolicy
-from lerobot.processor import PolicyProcessorPipeline, load_pretrained_policy_processors
-from lerobot.utils.constants import OBS_STATE
+from lerobot.processor import (
+    PolicyProcessorPipeline,
+    UnnormalizerProcessorStep,
+    hotswap_stats,
+    load_pretrained_policy_processors,
+)
+from lerobot.utils.constants import ACTION, OBS_STATE
+
+DEFAULT_ACTION_STATS = "so100.buffer.action"
 
 
 def scaled_rms_norm(layer: LlamaRMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -19,7 +26,7 @@ def scaled_rms_norm(layer: LlamaRMSNorm, x: torch.Tensor) -> torch.Tensor:
 
 
 def load_policy(
-    ckpt: Path, backbone: Path
+    ckpt: Path, backbone: Path, action_stats_key: str = DEFAULT_ACTION_STATS
 ) -> tuple[SmolVLAPolicy, PolicyProcessorPipeline, PolicyProcessorPipeline]:
     cfg = SmolVLAConfig.from_pretrained(ckpt)
     cfg.num_steps = 2
@@ -36,6 +43,19 @@ def load_policy(
             "device_processor": {"device": cfg.device},
         },
     )
+    # The base checkpoint namespaces its statistics by robot, but the processor looks up "action".
+    step = next((step for step in post.steps if isinstance(step, UnnormalizerProcessorStep)), None)
+    if step is None or not step.stats or action_stats_key not in step.stats:
+        raise ValueError(f"Missing checkpoint unnormalization statistics for {action_stats_key!r}")
+    stats = step.stats[action_stats_key]
+    feature = cfg.action_feature
+    if feature is None or any(
+        k not in stats or stats[k].shape != tuple(feature.shape) for k in ("mean", "std")
+    ):
+        raise ValueError(
+            f"Expected one mean and standard deviation per action dimension in {action_stats_key}"
+        )
+    post = hotswap_stats(post, {**step.stats, ACTION: stats})
     return policy, pre, post
 
 
@@ -85,6 +105,9 @@ def main() -> None:
         "--repeats", type=int, default=1, help="Force FP16 runs with the same input and noise"
     )
     parser.add_argument("--compare-fp32", action="store_true", help="Also run a separate FP32 reference")
+    parser.add_argument(
+        "--action-stats-key", default=DEFAULT_ACTION_STATS, help="Checkpoint action statistics"
+    )
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
@@ -92,7 +115,7 @@ def main() -> None:
         if not (directory / "config.json").is_file():
             parser.error(f"Missing {directory}/config.json")
 
-    policy, pre, post = load_policy(args.ckpt, args.backbone)
+    policy, pre, post = load_policy(args.ckpt, args.backbone, args.action_stats_key)
     cfg = policy.config
     rng = torch.Generator().manual_seed(42)
     state_feature = cfg.robot_state_feature

@@ -12,7 +12,13 @@ import numpy as np
 import torch
 import transformers
 
-from examples.smolvla_fp16.verify_fp16 import enable_force_fp16, infer_actions, load_policy, prepare_inputs
+from examples.smolvla_fp16.verify_fp16 import (
+    DEFAULT_ACTION_STATS,
+    enable_force_fp16,
+    infer_actions,
+    load_policy,
+    prepare_inputs,
+)
 from lerobot.policies.smolvla import SmolVLAPolicy
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import OBS_STATE
@@ -61,13 +67,16 @@ def main() -> None:
     parser.add_argument("--ckpt", type=Path, default=Path("checkpoints/smolvla_base"))
     parser.add_argument("--backbone", type=Path, default=Path("checkpoints/SmolVLM2-500M-Video-Instruct"))
     parser.add_argument("--out", type=Path, default=Path("outputs/smolvla_force_fp16_2step_baseline_10.zip"))
+    parser.add_argument(
+        "--action-stats-key", default=DEFAULT_ACTION_STATS, help="Checkpoint action statistics"
+    )
     args = parser.parse_args()
     if args.out.exists():
         parser.error(f"Output already exists: {args.out}")
     for directory in (args.ckpt, args.backbone):
         if not (directory / "config.json").is_file():
             parser.error(f"Missing {directory}/config.json")
-    policy, pre, post = load_policy(args.ckpt, args.backbone)
+    policy, pre, post = load_policy(args.ckpt, args.backbone, args.action_stats_key)
     norms = enable_force_fp16(policy)
     cfg = policy.config
     state = cfg.robot_state_feature
@@ -114,6 +123,7 @@ def main() -> None:
         manifest = {
             "format_version": 2,
             "scoring_output": "decoded",
+            "action_stats_key": args.action_stats_key,
             "model": "lerobot/smolvla_base",
             "weight_sha256": digest(args.ckpt / "model.safetensors"),
             "checkpoint_metadata_sha256": {

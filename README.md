@@ -24,6 +24,8 @@ HF_HUB_OFFLINE=1 uv run --locked --extra smolvla python -m examples.smolvla_fp16
 
 本实验固定使用 2 步 Flow Matching。图像、状态与初始噪声直接以 FP16 生成，词元编号和掩码保留原类型。预处理、模型前向和动作反归一化都在 Force FP16 上下文中执行，逐算子检查浮点输出。RMSNorm 在平方前按行最大绝对值缩放，降低溢出风险。CUDA 关闭 TF32 并允许 FP16 矩阵乘累加。逐算子检查覆盖 PyTorch 可见张量，内核内部的累加精度取决于实现。
 
+默认选用权重包中 `so100.buffer.action` 的 6 组均值和标准差，逐维执行 FP16 乘法，再执行 FP16 加法。两台设备需选用同一组参数。使用其他参数时，通过 `--action-stats-key` 指定，导出包的 `action_stats_key` 字段记录实际选择。
+
 第一条命令检查相同输入的重复推理结果。可加 `--compare-fp32` 单独运行 FP32 参考推理。第二条命令导出 10 条算例，并从磁盘逐条回放两次。跨设备评分使用 NX 按此配置导出的基准包，比较形状为 `[1,50,6]` 的 **FP16 反归一化最终动作**。[基准格式与回放示例](examples/smolvla_fp16/BASELINE.md)
 
 ## GR00T N1.7 纯 FP16 推理与精度复测
