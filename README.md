@@ -2,6 +2,28 @@
 
 ## SmolVLA 离线精度复测
 
+### 用已有基准包测试
+
+在 CUDA 测试机上，从仓库根目录运行以下命令。第一个参数可以是完整策略目录或其中的 `model.safetensors`，第二个参数可以是两步 FP16 基准 ZIP 或含 `manifest.json` 的解压目录。
+
+```bash
+./run_smolvla_test.sh /path/to/smolvla_base /path/to/smolvla_force_fp16_2step_baseline_10.zip
+```
+
+脚本核对权重、处理器和算例的 SHA256，按封存顺序对 10 条输入各执行 3 轮推理。每次使用封存的输入和 FP16 噪声，以 2 步 Flow Matching 生成动作，按基准指定的均值与标准差在 FP16 下反归一化。
+
+终端显示基准设备、测试设备和得分。每次运行在当前目录的 `outputs/smolvla_tests/` 下新建结果目录，其中包含：
+
+| 文件 | 内容 |
+|---|---|
+| `summary.json` | 精度 2A（40 分）、正常完成率 3A（10 分）、重复一致性 3B（10 分），以及有效调用次数和基准来源 |
+| `cases.csv` | 每条输入的 6 维相对误差、综合误差、三轮完成情况、重复误差、异常原因和得分 |
+| `round_1.npz` 至 `round_3.npz` | 各轮有效的 FP16 反归一化动作，按算例编号索引，每条形状为 `[1,50,6]` |
+
+运行环境需支持 CUDA 和 SmolVLA。脚本可使用已激活的 Python 环境或仓库的 `.venv`；首次使用 uv 可按锁文件安装依赖。分词器和视觉配置优先从权重目录内或同级的 `SmolVLM2-500M-Video-Instruct` 目录读取，也支持同级带版本号的 `SmolVLM2-500M*` 目录。缺失时自动获取固定版本的小型配置和分词文件。离线环境可提前准备这些文件。
+
+### 准备权重及导出基准
+
 在仓库根目录下载 SmolVLA 策略、归一化参数和 SmolVLM2 处理器。脚本从完整的策略 checkpoint 加载视觉语言模型和动作专家，因此 backbone 目录只需提供配置和分词文件。
 
 ```bash
@@ -10,7 +32,7 @@ hf download lerobot/smolvla_base \
   --local-dir checkpoints/smolvla_base
 hf download HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
   --revision 4cde9d208e19519c36917aa170fffc7e381aa0ad \
-  config.json preprocessor_config.json processor_config.json tokenizer.json tokenizer_config.json \
+  config.json generation_config.json preprocessor_config.json processor_config.json tokenizer.json tokenizer_config.json \
   special_tokens_map.json added_tokens.json chat_template.json vocab.json merges.txt \
   --local-dir checkpoints/SmolVLM2-500M-Video-Instruct
 ```

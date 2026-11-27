@@ -15,28 +15,12 @@
 
 manifest.json 记录步数、评分字段、权重及处理器文件的 SHA256、各算例的 SHA256 和运行环境。图像、状态和噪声直接按 FP16 生成，即使种子相同，也应使用 v2 包内实际封存的张量。旧版 10 步基准需要在 NX 上按新配置重新导出后才能用于两步实验评分。
 
-解压后可按下例在目标设备上回放一条算例。请从仓库根目录运行，并先按仓库 README 下载相同版本的策略和处理器。
+### 运行测试
 
-```python
-import json
-from pathlib import Path
+在仓库根目录运行以下命令，第二个参数也可指向包含 `manifest.json` 的解压目录。
 
-import numpy as np
-import torch
-
-from examples.smolvla_fp16.verify_fp16 import enable_force_fp16, infer_actions, load_policy
-
-manifest = json.loads(Path("manifest.json").read_text())
-policy, _, post = load_policy(
-    Path("checkpoints/smolvla_base"),
-    Path("checkpoints/SmolVLM2-500M-Video-Instruct"),
-    manifest["action_stats_key"],
-)
-enable_force_fp16(policy)
-with torch.inference_mode(), np.load("case_000.npz", allow_pickle=False) as case:
-    batch = {k[6:]: torch.from_numpy(case[k]).cuda() for k in case.files if k.startswith("input/")}
-    noise = torch.from_numpy(case["noise"]).cuda()
-    _, actions, _ = infer_actions(policy, post, batch, noise)
-    actual = actions.cpu().numpy()
-    reference = case["decoded"]
+```bash
+./run_smolvla_test.sh /path/to/smolvla_base /path/to/smolvla_force_fp16_2step_baseline_10.zip
 ```
+
+脚本从包中读取已封存的策略输入与噪声，每条输入运行三轮。终端输出 2A、3A 和 3B 得分及结果目录。目录中的 `summary.json` 汇总评分，`cases.csv` 记录逐条误差和完成情况，`round_1.npz` 至 `round_3.npz` 保存每轮有效的 FP16 反归一化动作。

@@ -1,7 +1,6 @@
 """Export and replay ten fixed SmolVLA Force FP16 cases on CUDA."""
 
 import argparse
-import hashlib
 import json
 import platform
 from pathlib import Path
@@ -12,8 +11,9 @@ import numpy as np
 import torch
 import transformers
 
-from examples.smolvla_fp16.verify_fp16 import (
+from examples.smolvla_fp16.runtime import (
     DEFAULT_ACTION_STATS,
+    digest,
     enable_force_fp16,
     infer_actions,
     load_policy,
@@ -35,14 +35,6 @@ TASKS = (
     "Place the cup on the table.",
     "Pick up the red cube.",
 )
-
-
-def digest(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(2**20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def infer(
